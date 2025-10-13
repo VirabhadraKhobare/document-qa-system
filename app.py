@@ -106,6 +106,25 @@ def safe_read_json(path: Path):
         return None
 
 
+def try_rerun():
+    """Safely attempt to rerun the Streamlit script.
+
+    Some Streamlit environments or versions may not expose `st.experimental_rerun`.
+    This helper calls it when available and otherwise logs and returns without
+    raising an AttributeError so the app doesn't crash.
+    """
+    try:
+        # prefer the documented API
+        return st.experimental_rerun()
+    except Exception as e:
+        # defensive: log and continue if rerun is not available in this runtime
+        try:
+            logger.debug(f"st.experimental_rerun unavailable or failed: {e}")
+        except Exception:
+            pass
+        return None
+
+
 # --- Streamlit caching & resources ---
 
 @st.cache_resource
@@ -333,7 +352,7 @@ def sidebar_controls():
         st.session_state.messages = []
         st.session_state.source_toggle = {}
         save_chat_history()
-        st.experimental_rerun()
+        try_rerun()
 
     if st.session_state.messages:
         chat_txt = format_chat_history(st.session_state.messages)
@@ -402,7 +421,7 @@ def process_uploaded_files(uploaded_files):
     if not all_chunk_objs:
         st.session_state.messages.append({"role": "assistant", "content": "No valid text found in uploaded PDFs. Index not created."})
         save_chat_history()
-        st.experimental_rerun()
+        try_rerun()
 
     with st.spinner("Creating vector index (FAISS)..."):
         try:
@@ -419,7 +438,7 @@ def process_uploaded_files(uploaded_files):
             st.session_state.messages.append({"role": "assistant", "content": f"Error creating index: {e}"})
 
     save_chat_history()
-    st.experimental_rerun()
+    try_rerun()
 
 
 def delete_index_and_session():
@@ -440,7 +459,7 @@ def delete_index_and_session():
     st.session_state.source_toggle = {}
     save_chat_history()
     st.success("Index and session cleared.")
-    st.experimental_rerun()
+    try_rerun()
 
 
 def summarize_documents():
@@ -486,7 +505,7 @@ def summarize_documents():
             # store in messages
             st.session_state.messages.append({"role": "assistant", "content": summary, "sources": [d.page_content[:150] + "..." for d in docs]})
             save_chat_history()
-            st.experimental_rerun()
+            try_rerun()
         except Exception as e:
             st.error(f"Summary generation failed: {e}")
 
@@ -565,7 +584,7 @@ def main():
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
             save_chat_history()
-            st.experimental_rerun()
+            try_rerun()
 
         # generate assistant response if last msg is from user
         if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
@@ -607,14 +626,14 @@ def main():
 
                         st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
                         save_chat_history()
-                        st.experimental_rerun()
+                        try_rerun()
 
                     except Exception as e:
                         err = f"An internal error occurred while answering: {e}"
                         st.error(err)
                         st.session_state.messages.append({"role": "assistant", "content": err})
                         save_chat_history()
-                        st.experimental_rerun()
+                        try_rerun()
 
     with sidebar_box:
         st.markdown("### Quick tools")
