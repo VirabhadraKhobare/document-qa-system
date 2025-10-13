@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import List, Dict
 
 import streamlit as st
-from PyPDF2 import PdfReader
+from pypdf import PdfReader
+import logging
+from io import StringIO
 from dotenv import load_dotenv
 
 # langchain pieces
@@ -31,14 +33,11 @@ from langchain.chains.question_answering import load_qa_chain
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# Google generative adapter (used if you want Gemini; optional)
-import google.generativeai as genai
-from langchain_google_genai import ChatGoogleGenerativeAI
+# NOTE: google.generativeai and langchain_google_genai are optional.
+# We'll import them lazily inside functions so the app can run without them.
 
 # --- Configuration & constants ---
 load_dotenv()
-
-st.set_page_config(page_title="Document Q&A System", layout="wide", initial_sidebar_state="expanded")
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 FAISS_DIR = Path("faiss_index")
@@ -51,17 +50,44 @@ CHUNK_OVERLAP = 200
 
 
 def load_google_api_key():
-    key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    # prefer session override, then Streamlit secrets, then environment
+    key = st.session_state.get("google_api_key") or st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
     return key
 
 
 def configure_google_genai(api_key: str):
-    """Configure google generative ai (optional). Returns True if success else False."""
+    """Configure google generative ai (optional). Returns True if success else False.
+
+    This does a lazy import of google.generativeai so the app can run even when
+    the package isn't installed.
+    """
     try:
+        import google.generativeai as genai  # type: ignore
         genai.configure(api_key=api_key)
         return True
     except Exception:
         return False
+
+
+# Setup module logger
+logger = logging.getLogger("document_qa")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_stream_handler)
+    # memory handler to capture logs for Streamlit UI
+    _memory_buf = StringIO()
+    _mem_handler = logging.StreamHandler(_memory_buf)
+    _mem_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_mem_handler)
+    # store handlers and buffer in module state
+    _LOG_BUF = _memory_buf
+    _LOG_MEM_HANDLER = _mem_handler
+else:
+    # reuse existing buffer handlers if module reloaded
+    _LOG_BUF = None
+    _LOG_MEM_HANDLER = None
 
 
 def safe_write_json(path: Path, data):
@@ -77,6 +103,25 @@ def safe_read_json(path: Path):
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        return None
+
+
+def try_rerun():
+    """Safely attempt to rerun the Streamlit script.
+
+    Some Streamlit environments or versions may not expose `st.experimental_rerun`.
+    This helper calls it when available and otherwise logs and returns without
+    raising an AttributeError so the app doesn't crash.
+    """
+    try:
+        # prefer the documented API
+        return st.experimental_rerun()
+    except Exception as e:
+        # defensive: log and continue if rerun is not available in this runtime
+        try:
+            logger.debug(f"st.experimental_rerun unavailable or failed: {e}")
+        except Exception:
+            pass
         return None
 
 
@@ -98,6 +143,21 @@ def get_faiss_if_exists():
         except Exception:
             return None
     return None
+
+
+def load_faiss_safe():
+    """Attempt to load FAISS index and return vectorstore or None.
+
+    This helper centralizes FAISS loading and returns None on any failure.
+    Use this instead of calling FAISS.load_local directly throughout the app.
+    """
+    try:
+        if not FAISS_DIR.exists():
+            return None
+        embeddings = get_embedding_model()
+        return FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
+    except Exception:
+        return None
 
 
 # --- Document processing functions ---
@@ -194,7 +254,26 @@ def get_conversational_chain(prompt_template: str, temperature: float = 0.2):
     Returns chain or None.
     """
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    # Try Gemini via ChatGoogleGenerativeAI (if configured). If not available, raise to let caller handle.
+    # Try Gemini via ChatGoogleGenerativeAI (if configured). We import lazily so
+    # the app can run without the optional packages.
+    api_key = load_google_api_key()
+    if not api_key:
+        return None
+
+    try:
+        # lazy import of optional packages
+        import google.generativeai as genai  # type: ignore
+        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+    except Exception:
+        return None
+
+    # configure genai (safe)
+    try:
+        genai.configure(api_key=api_key)
+    except Exception:
+        # If configuration fails, do not attempt to use Gemini
+        return None
+
     for model_name in MODEL_ORDER:
         try:
             model = ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
@@ -273,22 +352,38 @@ def sidebar_controls():
         st.session_state.messages = []
         st.session_state.source_toggle = {}
         save_chat_history()
-        st.experimental_rerun()
+        try_rerun()
 
     if st.session_state.messages:
         chat_txt = format_chat_history(st.session_state.messages)
         st.sidebar.download_button("Download Chat", chat_txt, file_name=f"chat_{int(time.time())}.txt")
 
     st.sidebar.markdown("---")
-    # API key check (optional)
-    api_key = load_google_api_key()
-    if not api_key:
-        st.sidebar.error("Google API key not set. Put in Streamlit secrets or .env to use Gemini.")
-    else:
-        if configure_google_genai(api_key):
-            st.sidebar.success("Google GenAI configured (Gemini models available if your key has access).")
+    # API key entry (optional) - allow pasting a key at runtime
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Google GenAI (optional)")
+    api_key_input = st.sidebar.text_input("Paste Google API key", value=st.session_state.get("google_api_key", ""), type="password")
+    if api_key_input:
+        st.session_state["google_api_key"] = api_key_input
+        ok = configure_google_genai(api_key_input)
+        if ok:
+            st.sidebar.success("Google GenAI configured.")
         else:
-            st.sidebar.warning("Google key present but GenAI config failed (check key).")
+            st.sidebar.error("Could not configure Google GenAI with provided key.")
+    else:
+        api_key = load_google_api_key()
+        if not api_key:
+            st.sidebar.info("Provide a Google API key to enable Gemini models.")
+
+    # Verbose logging toggle
+    st.sidebar.markdown("---")
+    verbose = st.sidebar.checkbox("Verbose logging", value=st.session_state.get("debug", False))
+    st.session_state["debug"] = verbose
+    if verbose:
+        # increase logger verbosity
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
 
 
 def format_chat_history(messages):
@@ -326,7 +421,7 @@ def process_uploaded_files(uploaded_files):
     if not all_chunk_objs:
         st.session_state.messages.append({"role": "assistant", "content": "No valid text found in uploaded PDFs. Index not created."})
         save_chat_history()
-        st.experimental_rerun()
+        try_rerun()
 
     with st.spinner("Creating vector index (FAISS)..."):
         try:
@@ -343,7 +438,7 @@ def process_uploaded_files(uploaded_files):
             st.session_state.messages.append({"role": "assistant", "content": f"Error creating index: {e}"})
 
     save_chat_history()
-    st.experimental_rerun()
+    try_rerun()
 
 
 def delete_index_and_session():
@@ -364,7 +459,7 @@ def delete_index_and_session():
     st.session_state.source_toggle = {}
     save_chat_history()
     st.success("Index and session cleared.")
-    st.experimental_rerun()
+    try_rerun()
 
 
 def summarize_documents():
@@ -373,8 +468,7 @@ def summarize_documents():
         st.warning("No documents indexed.")
         return
 
-    embeddings = get_embedding_model()
-    vs = FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
+    vs = load_faiss_safe()
 
     # fetch top-k docs (k = up to 10 or number of docs)
     try:
@@ -411,12 +505,14 @@ def summarize_documents():
             # store in messages
             st.session_state.messages.append({"role": "assistant", "content": summary, "sources": [d.page_content[:150] + "..." for d in docs]})
             save_chat_history()
-            st.experimental_rerun()
+            try_rerun()
         except Exception as e:
             st.error(f"Summary generation failed: {e}")
 
 
 def main():
+    st.set_page_config(page_title="Document Q&A System", layout="wide", initial_sidebar_state="expanded")
+
     st.write(
         """
         <div style="text-align:center;">
@@ -429,6 +525,19 @@ def main():
 
     init_session_state()
     sidebar_controls()
+
+    # if verbose logs requested, show the last captured logs
+    if st.session_state.get("debug"):
+        try:
+            # attempt to read buffer if present
+            if '_LOG_BUF' in globals() and globals()['_LOG_BUF'] is not None:
+                log_text = globals()['_LOG_BUF'].getvalue()
+            else:
+                log_text = "(no logs captured)"
+            st.markdown("### Logs")
+            st.text_area("Logs", value=log_text, height=200)
+        except Exception:
+            pass
 
     # show uploaded docs summary
     st.markdown("---")
@@ -475,7 +584,7 @@ def main():
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
             save_chat_history()
-            st.experimental_rerun()
+            try_rerun()
 
         # generate assistant response if last msg is from user
         if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
@@ -483,8 +592,9 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        embeddings = get_embedding_model()
-                        vs = FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
+                        vs = load_faiss_safe()
+                        if not vs:
+                            raise RuntimeError("FAISS index not available")
                         docs = vs.similarity_search(last_user_prompt, k=4)
 
                         qa_prompt = """
@@ -516,23 +626,28 @@ def main():
 
                         st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
                         save_chat_history()
-                        st.experimental_rerun()
+                        try_rerun()
 
                     except Exception as e:
                         err = f"An internal error occurred while answering: {e}"
                         st.error(err)
                         st.session_state.messages.append({"role": "assistant", "content": err})
                         save_chat_history()
-                        st.experimental_rerun()
+                        try_rerun()
 
     with sidebar_box:
         st.markdown("### Quick tools")
         if st.button("Show index info"):
             if st.session_state.faiss_ready:
-                embeddings = get_embedding_model()
-                vs = FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
-                n_docs = len(vs.index_to_docstore_id)
-                st.info(f"Indexed chunks: {n_docs}")
+                vs = load_faiss_safe()
+                if vs:
+                    try:
+                        n_docs = len(getattr(vs, 'index_to_docstore_id', []))
+                    except Exception:
+                        n_docs = 0
+                    st.info(f"Indexed chunks: {n_docs}")
+                else:
+                    st.warning("Index directory found but could not be loaded.")
             else:
                 st.warning("No index available.")
 
