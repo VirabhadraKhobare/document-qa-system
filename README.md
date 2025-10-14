@@ -37,7 +37,7 @@ Open `http://localhost:8501` and try uploading a PDF.
 
 ## ✨ Visual preview
 
-![Demo screenshot placeholder](screenshots/Screenshot_1.jpeg)
+![Demo screenshot placeholder](screenshots/Screenshot_1.png)
 
 
 ---
