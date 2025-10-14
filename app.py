@@ -1,667 +1,409 @@
-# app.py
-"""
-Document Q&A System - Refactored single-file Streamlit app
-Features:
- - Upload & process multiple PDFs
- - Fast cached SentenceTransformer embeddings
- - FAISS vector store saved/loaded locally
- - Document preview (per-page), per-chunk source metadata
- - Ask questions (retrieval + LLM chain) and show source snippets
- - Summarize document + download summary
- - Clear / delete index & session management
- - Improved UI, status badges, and safer error handling
-"""
-
+import streamlit as st
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
+import google.generativeai as genai
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
+import shutil
 import time
 import json
-from pathlib import Path
-from typing import List, Dict
 
-import streamlit as st
-from pypdf import PdfReader
-import logging
-from io import StringIO
-from dotenv import load_dotenv
-
-# langchain pieces
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
-
-# Embeddings + vectorstore
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_community.vectorstores import FAISS
-
-# NOTE: google.generativeai and langchain_google_genai are optional.
-# We'll import them lazily inside functions so the app can run without them.
-
-# --- Configuration & constants ---
+# --- Configuration ---
+# Load environment variables from .env file for local development
 load_dotenv()
 
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-FAISS_DIR = Path("faiss_index")
-CHAT_HISTORY_FILE = "chat_history.json"
+# Set Streamlit page configuration
+st.set_page_config(page_title="ChatPDF", layout="wide", initial_sidebar_state="expanded")
+
+# --- UI Styling (from app1.py) ---
+# Custom CSS for the dark, modern UI with WhatsApp-like chat messages
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+    /* Define animation */
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    html, body, [class*="st-"] {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    /* Hide other default Streamlit elements */
+    #MainMenu, footer, .stDeployButton {
+        visibility: hidden;
+    }
+    
+    /* Main app background */
+    .stApp {
+        background-color: #07101a;
+    }
+    
+    /* --- Sidebar Styling --- */
+    [data-testid="stSidebar"] {
+        background-color: #07101a;
+        border-right: 1px solid #13303f;
+    }
+    
+    /* Sidebar button (st.button & st.download_button) with glowing effect */
+    [data-testid="stSidebar"] .stButton button, 
+    [data-testid="stSidebar"] [data-testid="stDownloadButton"] button {
+        border-radius: 999px;
+        border: 1px solid #2c5970;
+        background-color: transparent;
+        color: #add8e6;
+        transition: all 0.2s ease-in-out;
+        box-shadow: 0 0 5px 0px rgba(0, 150, 255, 0.3);
+    }
+    [data-testid="stSidebar"] .stButton button:hover,
+    [data-testid="stSidebar"] [data-testid="stDownloadButton"] button:hover {
+        background-color: rgba(173, 216, 230, 0.1);
+        color: #fff;
+        border-color: #00aaff;
+        box-shadow: 0 0 10px 2px rgba(0, 150, 255, 0.6);
+    }
+    
+    /* Status badge styling */
+    .status-badge {
+        display: block; padding: 8px; border-radius: 20px;
+        font-weight: 600; margin: 12px auto; text-align: center;
+    }
+    .status-ready { background-color: rgba(25, 195, 125, 0.1); color: #19c37d; }
+    .status-not-ready { background-color: rgba(255, 102, 51, 0.1); color: #ff6633; }
+    
+    /* --- Main Chat Interface Styling --- */
+    .stChatMessage {
+        animation: fadeIn 0.5s ease-out;
+        transition: all 0.2s ease-in-out;
+    }
+    
+    /* The actual bubble inside the container */
+    div[data-testid="stChatMessage"] div[data-testid^="stMarkdownContainer"] {
+        border-radius: 12px;
+        padding: 14px 18px;
+        margin: 4px;
+        color: white;
+        border: 1px solid #2c5970;
+        box-shadow: 0 0 8px 1px rgba(0, 150, 255, 0.15);
+    }
+
+    /* Assistant message bubble styling */
+    div[data-testid="stChatMessage-assistant"] div[data-testid^="stMarkdownContainer"] {
+        background-color: #262D31; /* Dark grey, like WhatsApp dark mode */
+        border-bottom-left-radius: 4px; /* WhatsApp tail effect */
+    }
+
+    /* User message bubble styling - REMOVED background color */
+    div[data-testid="stChatMessage-user"] div[data-testid^="stMarkdownContainer"] {
+        background-color: transparent; 
+        border-bottom-right-radius: 4px; /* WhatsApp tail effect */
+    }
+    
+    /* Chat input box styling */
+    [data-testid="stChatInput"] textarea {
+        color: #FFFFFF; /* Makes the input text white and visible */
+        max-height: 150px; /* Make chat input box smaller */
+    }
+
+    /* Style for the "View Source" button specifically within the main chat area */
+    .main-chat-area .stButton>button {
+        background-color: transparent !important;
+        color: #add8e6 !important;
+        border: 1px solid #2c5970 !important;
+        padding: 2px 10px !important; /* Smaller padding */
+        font-size: 0.8rem !important; /* Smaller font */
+        border-radius: 999px !important;
+        margin: -8px 0 10px 10px; /* Positioning below the chat bubble */
+    }
+    .main-chat-area .stButton>button:hover {
+        border-color: #00aaff !important;
+        color: #fff !important;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- Google API Configuration ---
+# Use Streamlit secrets for deployed apps, fallback to .env for local development
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    st.error("Google API key not found. Please set it in Streamlit secrets or as a local .env file.")
+    st.stop()
+
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+except Exception as e:
+    st.error(f"Failed to configure Google Generative AI: {e}")
+    st.stop()
+
+
+# --- Constants ---
+# Define the preferred model order, with fallbacks for the generative part
 MODEL_ORDER = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-
-# --- Helper utilities ---
-
-
-def load_google_api_key():
-    # prefer session override, then Streamlit secrets, then environment
-    key = st.session_state.get("google_api_key") or st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    return key
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+FAISS_DIR = "faiss_index"
+CHAT_HISTORY_FILE = "chat_history.json"
 
 
-def configure_google_genai(api_key: str):
-    """Configure google generative ai (optional). Returns True if success else False.
+# --- Helper Functions ---
 
-    This does a lazy import of google.generativeai so the app can run even when
-    the package isn't installed.
-    """
-    try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=api_key)
-        return True
-    except Exception:
-        return False
-
-
-# Setup module logger
-logger = logging.getLogger("document_qa")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    _stream_handler = logging.StreamHandler()
-    _stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(_stream_handler)
-    # memory handler to capture logs for Streamlit UI
-    _memory_buf = StringIO()
-    _mem_handler = logging.StreamHandler(_memory_buf)
-    _mem_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(_mem_handler)
-    # store handlers and buffer in module state
-    _LOG_BUF = _memory_buf
-    _LOG_MEM_HANDLER = _mem_handler
-else:
-    # reuse existing buffer handlers if module reloaded
-    _LOG_BUF = None
-    _LOG_MEM_HANDLER = None
-
-
-def safe_write_json(path: Path, data):
-    try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        st.warning(f"Could not save file {path}: {e}")
-
-
-def safe_read_json(path: Path):
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def try_rerun():
-    """Safely attempt to rerun the Streamlit script.
-
-    Some Streamlit environments or versions may not expose `st.experimental_rerun`.
-    This helper calls it when available and otherwise logs and returns without
-    raising an AttributeError so the app doesn't crash.
-    """
-    try:
-        # prefer the documented API
-        return st.experimental_rerun()
-    except Exception as e:
-        # defensive: log and continue if rerun is not available in this runtime
+def get_pdf_text(pdf_docs):
+    """Extract text from a list of uploaded PDF files."""
+    text = ""
+    for pdf in pdf_docs:
         try:
-            logger.debug(f"st.experimental_rerun unavailable or failed: {e}")
-        except Exception:
-            pass
-        return None
+            pdf_reader = PdfReader(pdf)
+            # Add metadata for source highlighting
+            for i, page in enumerate(pdf_reader.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    text += f"\n--- Source: {pdf.name}, Page: {i+1} ---\n{page_text}"
+        except Exception as e:
+            st.warning(f"Could not read file: {pdf.name}. Error: {e}")
+    return text
 
-
-# --- Streamlit caching & resources ---
+def get_text_chunks(text):
+    """Split text into manageable chunks for processing."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
 @st.cache_resource
 def get_embedding_model():
-    """Return SentenceTransformerEmbeddings object (cached)."""
+    """Load the sentence transformer model, cached for performance."""
     return SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 
-
-@st.cache_resource
-def get_faiss_if_exists():
-    """Return loaded FAISS vectorstore if FAISS_DIR exists, else None."""
-    if FAISS_DIR.exists():
-        try:
-            embeddings = get_embedding_model()
-            return FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
-        except Exception:
-            return None
-    return None
-
-
-def load_faiss_safe():
-    """Attempt to load FAISS index and return vectorstore or None.
-
-    This helper centralizes FAISS loading and returns None on any failure.
-    Use this instead of calling FAISS.load_local directly throughout the app.
-    """
+def get_vector_store(text_chunks):
+    """Create and save a FAISS vector store from text chunks using a local model."""
     try:
-        if not FAISS_DIR.exists():
-            return None
         embeddings = get_embedding_model()
-        return FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
-    except Exception:
-        return None
-
-
-# --- Document processing functions ---
-
-
-def extract_text_from_pdf(file) -> Dict[int, str]:
-    """
-    Read a PdfReader file-like object and return a dict of {page_num: text}.
-    file is a streamlit UploadedFile (has .read() and .name).
-    """
-    page_texts = {}
-    try:
-        reader = PdfReader(file)
-        for i, p in enumerate(reader.pages):
-            t = p.extract_text()
-            page_texts[i + 1] = t or ""
+        vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+        vector_store.save_local(FAISS_DIR)
+        st.session_state.faiss_ready = True
     except Exception as e:
-        st.warning(f"Failed to read {getattr(file, 'name', 'uploaded file')}: {e}")
-    return page_texts
+        st.error(f"Error creating vector store: {e}")
+        st.session_state.faiss_ready = False
 
-
-def build_chunks_from_pages(file_name: str, page_texts: Dict[int, str]) -> List[Dict]:
-    """
-    Split pages into chunks and attach metadata for source-tracking.
-    Returns list of dicts: {"text": ..., "metadata": {...}}
-    """
-    text_concat = []
-    metadata_map = []
-
-    for page_no, text in page_texts.items():
-        if text.strip():
-            # prefix small header for each page to keep trace
-            section_text = f"--- Source: {file_name}, Page: {page_no} ---\n{text}"
-            text_concat.append(section_text)
-            metadata_map.append({"source": file_name, "page": page_no})
-
-    all_text = "\n\n".join(text_concat)
-    if not all_text.strip():
-        return []
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    chunks = splitter.split_text(all_text)
-
-    # Create per-chunk metadata by attempting to preserve page info (simple heuristic):
-    chunk_objs = []
-    for idx, ch in enumerate(chunks):
-        # Try to find the closest page header in the chunk (if present)
-        source = None
-        page_no = None
-        if "--- Source:" in ch:
-            # parse first header occurrence
-            try:
-                header_line = [ln for ln in ch.splitlines() if ln.startswith("--- Source:")][0]
-                # header format: --- Source: filename, Page: N ---
-                header_line = header_line.replace("---", "").strip()
-                parts = header_line.split(",")
-                source = parts[0].replace("Source:", "").strip()
-                page_part = parts[1].replace("Page:", "").strip()
-                page_no = int(page_part)
-            except Exception:
-                source = file_name
-        else:
-            source = file_name
-
-        md = {"source": source or file_name, "page": page_no or 0, "chunk_id": idx}
-        chunk_objs.append({"text": ch, "metadata": md})
-    return chunk_objs
-
-
-def create_faiss_from_chunks(chunk_objs: List[Dict]):
-    """
-    Create FAISS vectorstore from chunk objects (list of {"text","metadata"}).
-    Save to FAISS_DIR.
-    """
-    if not chunk_objs:
-        return None
-    texts = [c["text"] for c in chunk_objs]
-    metadatas = [c["metadata"] for c in chunk_objs]
-
-    embeddings = get_embedding_model()
-    vs = FAISS.from_texts(texts, embedding=embeddings, metadatas=metadatas)
-    # ensure directory
-    FAISS_DIR.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(FAISS_DIR))
-    return vs
-
-
-# --- QA chain ---
-
-
-def get_conversational_chain(prompt_template: str, temperature: float = 0.2):
-    """
-    Create a QA chain using the first available model in MODEL_ORDER.
-    Returns chain or None.
-    """
+def get_conversational_chain(prompt_template):
+    """Create a conversational QA chain with a custom prompt and model fallback."""
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    # Try Gemini via ChatGoogleGenerativeAI (if configured). We import lazily so
-    # the app can run without the optional packages.
-    api_key = load_google_api_key()
-    if not api_key:
-        return None
-
-    try:
-        # lazy import of optional packages
-        import google.generativeai as genai  # type: ignore
-        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
-    except Exception:
-        return None
-
-    # configure genai (safe)
-    try:
-        genai.configure(api_key=api_key)
-    except Exception:
-        # If configuration fails, do not attempt to use Gemini
-        return None
-
+    
     for model_name in MODEL_ORDER:
         try:
-            model = ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
+            model = ChatGoogleGenerativeAI(model=model_name, temperature=0.3)
             chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-            st.session_state["last_model_used"] = model_name
+            st.session_state.last_model_used = model_name
             return chain
         except Exception:
-            continue
+            st.warning(f"Model {model_name} not available. Trying next model.")
+    
+    st.error("All specified Gemini models are unavailable. Please check your API key and model access.")
     return None
 
-
-# --- Chat history persistence ---
-
+def format_chat_history(messages):
+    """Formats the chat history for downloading."""
+    chat_str = "Chat History\n"
+    chat_str += "="*20 + "\n\n"
+    for msg in messages:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        content = msg['content']
+        chat_str += f"[{role}]:\n{content}\n\n"
+        chat_str += "-"*20 + "\n\n"
+    return chat_str
 
 def save_chat_history():
-    try:
-        safe_write_json(Path(CHAT_HISTORY_FILE), st.session_state.get("messages", []))
-    except Exception:
-        st.warning("Could not save chat history.")
-
+    """Save chat history to a JSON file."""
+    with open(CHAT_HISTORY_FILE, "w") as f:
+        json.dump(st.session_state.messages, f)
 
 def load_chat_history():
-    data = safe_read_json(Path(CHAT_HISTORY_FILE))
-    if isinstance(data, list):
-        return data
+    """Load chat history from a JSON file if it exists."""
+    if os.path.exists(CHAT_HISTORY_FILE):
+        with open(CHAT_HISTORY_FILE, "r") as f:
+            return json.load(f)
     return []
 
+# --- Main Application ---
+def main():
+    """Main function to run the Streamlit application."""
 
-# --- Streamlit UI & App logic ---
-
-
-def init_session_state():
+    # Initialize session state variables
     if "messages" not in st.session_state:
         st.session_state.messages = load_chat_history()
     if "faiss_ready" not in st.session_state:
-        st.session_state.faiss_ready = get_faiss_if_exists() is not None
+        st.session_state.faiss_ready = os.path.isdir(FAISS_DIR)
+    # This dictionary will hold the visibility state for each source button
     if "source_toggle" not in st.session_state:
         st.session_state.source_toggle = {}
-    if "uploaded_docs" not in st.session_state:
-        st.session_state.uploaded_docs = []  # list of filenames processed
-    if "last_model_used" not in st.session_state:
-        st.session_state.last_model_used = None
 
 
-def sidebar_controls():
-    st.sidebar.title("📄 Document Q&A")
-    st.sidebar.markdown("A fast, simple assistant for your PDFs.")
-
-    # Status badge
-    status = "Ready" if st.session_state.faiss_ready else "No Documents"
-    status_class = "✅" if st.session_state.faiss_ready else "❗"
-    st.sidebar.markdown(f"**Status:** {status_class} {status}")
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("1) Upload PDFs")
-    uploaded_files = st.sidebar.file_uploader("Upload PDF files", accept_multiple_files=True, type=["pdf"], key="uploader")
-
-    if uploaded_files:
-        st.sidebar.write(f"{len(uploaded_files)} file(s) selected")
-        if st.sidebar.button("Process uploaded files", use_container_width=True):
-            process_uploaded_files(uploaded_files)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("2) Document Tools")
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.sidebar.button("Summarize Documents", disabled=not st.session_state.faiss_ready, use_container_width=True):
-            summarize_documents()
-    with col2:
-        if st.sidebar.button("Delete Index & Session", use_container_width=True):
-            delete_index_and_session()
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("3) Session")
-    if st.sidebar.button("Clear Conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.source_toggle = {}
-        save_chat_history()
-        try_rerun()
-
-    if st.session_state.messages:
-        chat_txt = format_chat_history(st.session_state.messages)
-        st.sidebar.download_button("Download Chat", chat_txt, file_name=f"chat_{int(time.time())}.txt")
-
-    st.sidebar.markdown("---")
-    # API key entry (optional) - allow pasting a key at runtime
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Google GenAI (optional)")
-    api_key_input = st.sidebar.text_input("Paste Google API key", value=st.session_state.get("google_api_key", ""), type="password")
-    if api_key_input:
-        st.session_state["google_api_key"] = api_key_input
-        ok = configure_google_genai(api_key_input)
-        if ok:
-            st.sidebar.success("Google GenAI configured.")
-        else:
-            st.sidebar.error("Could not configure Google GenAI with provided key.")
-    else:
-        api_key = load_google_api_key()
-        if not api_key:
-            st.sidebar.info("Provide a Google API key to enable Gemini models.")
-
-    # Verbose logging toggle
-    st.sidebar.markdown("---")
-    verbose = st.sidebar.checkbox("Verbose logging", value=st.session_state.get("debug", False))
-    st.session_state["debug"] = verbose
-    if verbose:
-        # increase logger verbosity
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
-
-
-def format_chat_history(messages):
-    s = "Chat History\n" + "=" * 20 + "\n\n"
-    for m in messages:
-        role = "User" if m.get("role") == "user" else "Assistant"
-        s += f"[{role}]\n{m.get('content', '')}\n"
-        if m.get("sources"):
-            s += "Sources:\n"
-            for src in m["sources"]:
-                s += "- " + src + "\n"
-        s += "\n" + ("-" * 30) + "\n\n"
-    return s
-
-
-def process_uploaded_files(uploaded_files):
-    """Process uploaded PDF files into FAISS index (overwrites previous index)."""
-    st.session_state.messages.append({"role": "assistant", "content": "Document processing started..."})
-    save_chat_history()
-
-    all_chunk_objs = []
-    processed_files = []
-
-    with st.spinner("Extracting text & chunking..."):
-        for f in uploaded_files:
-            page_texts = extract_text_from_pdf(f)
-            if not page_texts:
-                st.warning(f"No readable text extracted from {f.name}. It might be scanned images or unsupported PDF.")
-                continue
-            chunk_objs = build_chunks_from_pages(f.name, page_texts)
-            if chunk_objs:
-                all_chunk_objs.extend(chunk_objs)
-                processed_files.append(f.name)
-
-    if not all_chunk_objs:
-        st.session_state.messages.append({"role": "assistant", "content": "No valid text found in uploaded PDFs. Index not created."})
-        save_chat_history()
-        try_rerun()
-
-    with st.spinner("Creating vector index (FAISS)..."):
-        try:
-            vs = create_faiss_from_chunks(all_chunk_objs)
-            if vs:
-                st.session_state.faiss_ready = True
-                st.session_state.uploaded_docs = processed_files
-                st.success("Documents processed and indexed successfully.")
-                st.session_state.messages.append({"role": "assistant", "content": f"Processed documents: {', '.join(processed_files)}"})
-            else:
-                st.error("Failed to create vector store.")
-        except Exception as e:
-            st.error(f"Error while creating vector store: {e}")
-            st.session_state.messages.append({"role": "assistant", "content": f"Error creating index: {e}"})
-
-    save_chat_history()
-    try_rerun()
-
-
-def delete_index_and_session():
-    """Delete FAISS directory and clear session data."""
-    try:
-        if FAISS_DIR.exists():
-            for p in FAISS_DIR.glob("*"):
-                p.unlink()
-            FAISS_DIR.rmdir()
-    except Exception:
-        # fallback: attempt removing tree carefully
-        import shutil
-        shutil.rmtree(str(FAISS_DIR), ignore_errors=True)
-
-    st.session_state.faiss_ready = False
-    st.session_state.uploaded_docs = []
-    st.session_state.messages = []
-    st.session_state.source_toggle = {}
-    save_chat_history()
-    st.success("Index and session cleared.")
-    try_rerun()
-
-
-def summarize_documents():
-    """Create a short summary of the whole index by doing a similarity search and asking the model to summarize."""
-    if not st.session_state.faiss_ready:
-        st.warning("No documents indexed.")
-        return
-
-    vs = load_faiss_safe()
-
-    # fetch top-k docs (k = up to 10 or number of docs)
-    try:
-        docs = vs.similarity_search("Summarize the document", k=min(10, len(vs.index_to_docstore_id)))
-    except Exception:
-        docs = []
-
-    if not docs:
-        st.warning("Could not retrieve document chunks for summary.")
-        return
-
-    summary_prompt = """
-    Based on the following context, provide a concise summary (bullet points, 6-10 items max).
-    Focus on key topics, findings, and any concrete facts found in the text.
-
-    Context:
-    {context}
-
-    Question:
-    {question}
-
-    Summary:
-    """
-
-    chain = get_conversational_chain(summary_prompt)
-    if not chain:
-        st.error("Could not initialize model chain for summarization. Check API / model access.")
-        return
-
-    with st.spinner("Generating summary..."):
-        try:
-            resp = chain({"input_documents": docs, "question": "Summarize the document."}, return_only_outputs=True)
-            summary = resp.get("output_text") or "No summary produced."
-            # store in messages
-            st.session_state.messages.append({"role": "assistant", "content": summary, "sources": [d.page_content[:150] + "..." for d in docs]})
-            save_chat_history()
-            try_rerun()
-        except Exception as e:
-            st.error(f"Summary generation failed: {e}")
-
-
-def main():
-    st.set_page_config(page_title="Document Q&A System", layout="wide", initial_sidebar_state="expanded")
-
-    st.write(
-        """
-        <div style="text-align:center;">
-            <h1 style="color: #fff; font-weight:700;">📄 Document Q&A System</h1>
-            <p style="color: #bcd; margin-top:-12px;">Upload PDFs, index them and ask questions. Source-aware answers.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    init_session_state()
-    sidebar_controls()
-
-    # if verbose logs requested, show the last captured logs
-    if st.session_state.get("debug"):
-        try:
-            # attempt to read buffer if present
-            if '_LOG_BUF' in globals() and globals()['_LOG_BUF'] is not None:
-                log_text = globals()['_LOG_BUF'].getvalue()
-            else:
-                log_text = "(no logs captured)"
-            st.markdown("### Logs")
-            st.text_area("Logs", value=log_text, height=200)
-        except Exception:
-            pass
-
-    # show uploaded docs summary
-    st.markdown("---")
-    st.subheader("Indexed Documents")
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        if st.session_state.uploaded_docs:
-            st.info(", ".join(st.session_state.uploaded_docs))
-        else:
-            st.write("No documents indexed yet. Upload PDFs in the sidebar to get started.")
-    with col_b:
-        if st.session_state.faiss_ready:
-            st.success("Index ready")
-        else:
-            st.warning("Index not available")
-
-    # Chat interface
-    st.markdown("---")
-    st.subheader("Chat with your documents")
-    chat_box, sidebar_box = st.columns([3, 1])
-
-    with chat_box:
-        # display messages
-        for idx, msg in enumerate(st.session_state.messages):
-            role = msg.get("role", "assistant")
-            with st.chat_message(role):
-                st.markdown(msg.get("content", ""))
-
-            # add view source button for assistant messages with sources
-            if role == "assistant" and msg.get("sources"):
-                key = f"src_{idx}"
-                if st.button("📄 View Source", key=key):
-                    st.session_state.source_toggle[idx] = not st.session_state.source_toggle.get(idx, False)
-
-                if st.session_state.source_toggle.get(idx):
-                    # show sources as info boxes
-                    for s in msg.get("sources", [])[:5]:
-                        st.info(s)
-
-        # input
-        prompt_placeholder = "Process documents first..." if not st.session_state.faiss_ready else "Ask a question..."
-        user_input = st.chat_input(prompt_placeholder, disabled=not st.session_state.faiss_ready)
-
-        if user_input:
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            save_chat_history()
-            try_rerun()
-
-        # generate assistant response if last msg is from user
-        if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-            last_user_prompt = st.session_state.messages[-1]["content"]
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        vs = load_faiss_safe()
-                        if not vs:
-                            raise RuntimeError("FAISS index not available")
-                        docs = vs.similarity_search(last_user_prompt, k=4)
-
-                        qa_prompt = """
-                        Answer the question using ONLY the provided context. If the answer is not in the context, reply:
-                        "The answer is not available in the context." Be concise and show references.
-                        Context:
-                        {context}
-
-                        Question:
-                        {question}
-
-                        Answer:
-                        """
-
-                        chain = get_conversational_chain(qa_prompt)
-                        if not chain:
-                            answer = "Could not initialize the LLM chain. Check model/API access."
-                        else:
-                            resp = chain({"input_documents": docs, "question": last_user_prompt}, return_only_outputs=True)
-                            answer = resp.get("output_text", "No answer generated.")
-
-                        # sources: create friendly source strings
-                        sources = []
-                        for d in docs:
-                            md = getattr(d, "metadata", {}) or {}
-                            src = md.get("source") or md.get("file") or "unknown"
-                            page = md.get("page", 0)
-                            sources.append(f"{src} (page {page})")
-
-                        st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
-                        save_chat_history()
-                        try_rerun()
-
-                    except Exception as e:
-                        err = f"An internal error occurred while answering: {e}"
-                        st.error(err)
-                        st.session_state.messages.append({"role": "assistant", "content": err})
-                        save_chat_history()
-                        try_rerun()
-
-    with sidebar_box:
-        st.markdown("### Quick tools")
-        if st.button("Show index info"):
-            if st.session_state.faiss_ready:
-                vs = load_faiss_safe()
-                if vs:
-                    try:
-                        n_docs = len(getattr(vs, 'index_to_docstore_id', []))
-                    except Exception:
-                        n_docs = 0
-                    st.info(f"Indexed chunks: {n_docs}")
+    # --- Sidebar for Document and Session Management ---
+    with st.sidebar:
+        st.header("📄 ChatPDF")
+        st.markdown("Your personal document assistant.")
+        
+        status_text = "Ready" if st.session_state.faiss_ready else "No Documents"
+        status_class = "status-ready" if st.session_state.faiss_ready else "status-not-ready"
+        st.markdown(f'<div class="status-badge {status_class}">Status: {status_text}</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        st.subheader("1. Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Upload your PDF files here.",
+            accept_multiple_files=True,
+            type=['pdf'],
+            label_visibility="collapsed"
+        )
+        
+        if st.button("2. Process Documents", use_container_width=True, disabled=not uploaded_files):
+            with st.spinner("Processing documents... This may take a moment."):
+                raw_text = get_pdf_text(uploaded_files)
+                if raw_text.strip():
+                    chunks = get_text_chunks(raw_text)
+                    get_vector_store(chunks)
+                    st.success("✅ Documents processed!")
+                    time.sleep(1)
+                    st.rerun()
                 else:
-                    st.warning("Index directory found but could not be loaded.")
-            else:
-                st.warning("No index available.")
+                    st.error("Processing failed. No readable text found in PDFs.")
 
         st.markdown("---")
-        st.markdown("### About")
-        st.markdown(
-            """
-            - Simple Document Q&A using embeddings + a generative model.
-            - Keeps message history locally in chat_history.json.
-            - For best results, upload searchable PDFs (not scanned images).
-            """
-        )
+        st.subheader("2. Advanced Options")
+        if st.button("📝 Summarize PDF", use_container_width=True, disabled=not st.session_state.faiss_ready):
+            with st.spinner("Summarizing document..."):
+                try:
+                    embeddings = get_embedding_model()
+                    vector_store = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
+                    docs = vector_store.similarity_search("Summarize the entire document", k=len(vector_store.index_to_docstore_id))
+                    
+                    summary_prompt_template = """
+                    Based on the following context, provide a concise summary in bullet points.
+                    Focus on the key topics, findings, and conclusions.\n\n
+                    Context:\n {context}\n
+                    Question: \n{question}\n
 
-    # end main
+                    Summary:
+                    """
+                    chain = get_conversational_chain(summary_prompt_template)
+                    if chain:
+                        response = chain({"input_documents": docs, "question": "Summarize the entire document."}, return_only_outputs=True)
+                        summary = response.get("output_text", "Could not generate a summary.")
+                        st.session_state.messages.append({"role": "assistant", "content": summary, "sources": [doc.page_content[:150] + "..." for doc in docs]})
+                        save_chat_history()
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"An error occurred during summarization: {e}")
+
+        st.markdown("---")
+        st.subheader("3. Manage Session")
+        if st.button("Clear Conversation", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.source_toggle = {}
+            save_chat_history()
+            st.rerun()
+
+        if st.session_state.messages:
+            chat_history_str = format_chat_history(st.session_state.messages)
+            st.download_button(
+                label="Download Chat",
+                data=chat_history_str,
+                file_name=f"chat_history_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+
+        if st.session_state.faiss_ready and st.button("Delete Documents", use_container_width=True):
+            shutil.rmtree(FAISS_DIR, ignore_errors=True)
+            st.session_state.faiss_ready = False
+            st.session_state.messages = []
+            st.session_state.source_toggle = {}
+            save_chat_history()
+            st.success("Documents and index deleted.")
+            time.sleep(1)
+            st.rerun()
+            
+    # --- Main Chat Interface ---
+    st.markdown("""
+    <div style="text-align: center; margin-bottom: 20px;">
+        <h1 style="font-size: 3em; font-weight: 700; color: #FFFFFF;">
+            <span style="margin-right: 15px;">📄</span>Chat With Your Documents
+        </h1>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Wrap chat area in a div to scope the button style
+    st.markdown('<div class="main-chat-area">', unsafe_allow_html=True)
+
+    # Display chat messages
+    for idx, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+        
+        # Render the button and source info OUTSIDE the chat bubble for assistants
+        if msg["role"] == "assistant" and "sources" in msg and msg["sources"]:
+            if st.button("📄 View Source", key=f"src_{idx}"):
+                # Toggle the visibility state for this specific message index
+                st.session_state.source_toggle[idx] = not st.session_state.source_toggle.get(idx, False)
+            
+            # Conditionally display the source info based on the toggle state
+            if st.session_state.source_toggle.get(idx, False):
+                st.info("".join(msg["sources"]))
+
+    # Chat input
+    prompt_placeholder = "Please process documents first..." if not st.session_state.faiss_ready else "Ask a question..."
+    if prompt := st.chat_input(prompt_placeholder, disabled=not st.session_state.faiss_ready):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Rerun to show the user's message immediately
+        st.rerun()
+
+    # Handle assistant response generation if the last message is from the user
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    last_user_prompt = st.session_state.messages[-1]['content']
+                    embeddings = get_embedding_model()
+                    vector_store = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
+                    docs = vector_store.similarity_search(last_user_prompt, k=4)
+                    
+                    qa_prompt_template = """
+                    Answer the question as detailed as possible from the provided context. If the answer is not in
+                    the provided context, just say, "The answer is not available in the context." Do not provide a wrong answer.\n\n
+                    Context:\n {context}\n
+                    Question: \n{question}\n
+
+                    Answer:
+                    """
+                    chain = get_conversational_chain(qa_prompt_template)
+                    if chain:
+                        response = chain({"input_documents": docs, "question": last_user_prompt}, return_only_outputs=True)
+                        answer = response.get("output_text", "Sorry, I couldn't generate a response.")
+                    else:
+                        answer = "The conversation chain could not be initialized. Please check the logs."
+                    
+                    sources = [doc.page_content[:150] + "..." for doc in docs]
+                    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
+                    save_chat_history()
+                    # Rerun to display the new assistant message and its source button
+                    st.rerun()
+
+                except Exception as e:
+                    error_message = f"An error occurred: {e}"
+                    st.error(error_message)
+                    st.session_state.messages.append({"role": "assistant", "content": error_message})
+                    save_chat_history()
+                    st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
